@@ -3,9 +3,21 @@
 """LLM2Vec encoder wrapper for Kimodo text conditioning."""
 
 import os
+from typing import Optional, Union
 
 import numpy as np
 import torch
+from torch import nn
+
+
+def _text_encoder_device(device: Optional[Union[str, torch.device]] = None) -> torch.device:
+    """Pick a device for dummy / lightweight encoders; map unavailable CUDA to CPU."""
+    if device is None:
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    d = torch.device(device)
+    if d.type == "cuda" and not torch.cuda.is_available():
+        return torch.device("cpu")
+    return d
 
 from .llm2vec import LLM2Vec
 
@@ -19,7 +31,6 @@ class LLM2VecEncoder:
         peft_model_name_or_path: str,
         dtype: str,
         llm_dim: int,
-        device: str = "auto",
     ) -> None:
         torch_dtype = getattr(torch, dtype)
         self.llm_dim = llm_dim
@@ -36,23 +47,12 @@ class LLM2VecEncoder:
             torch_dtype=torch_dtype,
             cache_dir=cache_dir,
         )
-
-        env_device = os.environ.get("TEXT_ENCODER_DEVICE")
-        if env_device:
-            device = env_device
-        if device == "auto":
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-        self._device = device
-        if device is not None:
-            self.model = self.model.to(device)
-
         self.model.eval()
         for p in self.model.parameters():
             p.requires_grad = False
 
     def to(self, device: torch.device):
         self.model = self.model.to(device)
-        self._device = str(device) if not isinstance(device, str) else device
         return self
 
     def eval(self):
@@ -69,17 +69,7 @@ class LLM2VecEncoder:
             is_string = True
 
         with torch.no_grad():
-            encoded_text = self.model.encode(
-                text,
-                # IMPORTANT: different batch sizes unexpectedly change the output embeddings, so we always set it to 1
-                #            here for repeatability no matter how many texts are being encoded. This
-                #            is a fundamental issue with transformers, and is especially bad at lower
-                #            precisions (https://github.com/huggingface/transformers/issues/25420#issuecomment-1775317535)
-                #            note: this is an internal batch size used by llm2vec - the text list can still be of arbitrary length.
-                batch_size=1,
-                show_progress_bar=False,
-                device=self._device,
-            )
+            encoded_text = self.model.encode(text, batch_size=len(text), show_progress_bar=False)
 
         assert len(encoded_text.shape)
         assert self.llm_dim == encoded_text.shape[-1]
@@ -91,5 +81,46 @@ class LLM2VecEncoder:
             encoded_text = encoded_text[0]
             lengths = lengths[0]
 
-        encoded_text = torch.tensor(encoded_text).to(self._device)
+        encoded_text = torch.tensor(encoded_text).to(self.get_device())
+        return encoded_text, lengths
+
+
+class DummyTextEncoder(nn.Module):
+    """Zero-vector text encoder for constraint-only generation without LLM weights.
+
+    Activated by setting TEXT_ENCODER_MODE=dummy. Returns zero embeddings
+    of the correct shape (llm_dim=4096), which the model treats as
+    unconditional (same as empty-text in classifier-free guidance training).
+
+    This allows running Kimodo on GPUs with <17GB VRAM and without
+    Llama-3 access, using only kinematic constraints for motion control.
+
+    Subclasses ``nn.Module`` so ``Kimodo.to(device)`` moves outputs to the same
+    device as the denoiser; defaults to CPU when PyTorch has no CUDA build.
+    """
+
+    def __init__(self, llm_dim: int = 4096, device: Optional[Union[str, torch.device]] = None) -> None:
+        super().__init__()
+        self.llm_dim = llm_dim
+        dev = _text_encoder_device(device)
+        self.register_buffer("_device_anchor", torch.zeros((), device=dev), persistent=False)
+        print(f"[Kimodo] Using DummyTextEncoder (zero embeddings, dim={llm_dim})")
+        print("[Kimodo] Text prompts will be ignored. Use constraints for motion control.")
+
+    def get_device(self):
+        return self._device_anchor.device
+
+    def forward(self, text: list[str] | str):
+        is_string = False
+        if isinstance(text, str):
+            text = [text]
+            is_string = True
+
+        encoded_text = torch.zeros(len(text), 1, self.llm_dim, device=self.get_device())
+        lengths = np.ones(len(text), dtype=int).tolist()
+
+        if is_string:
+            encoded_text = encoded_text[0]
+            lengths = lengths[0]
+
         return encoded_text, lengths

@@ -37,6 +37,12 @@ class CMakeBuild(build_ext):
         cmake_args = [
             f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extdir}",
             f"-DPYTHON_EXECUTABLE={sys.executable}",
+            # Disable LTO. pybind11_add_module enables it by default, which on
+            # Linux causes GCC's lto-wrapper to spawn a sub-make at link time
+            # that fails to inherit the parent jobserver fd (bug shows up as
+            # "write jobserver: Bad file descriptor"). Disabling LTO keeps the
+            # parallel compile and avoids the broken recursive-make path.
+            "-DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF",
         ]
 
         cfg = "Debug" if self.debug else "Release"
